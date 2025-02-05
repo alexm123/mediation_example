@@ -80,7 +80,6 @@ df_params <- expand.grid(
   pop_alpha = effect_sizes, 
   pop_beta = effect_sizes, 
   pop_tau_prime = effect_sizes)
-num_reps <- 1000  # Number of replications per condition
 
 # Making some fake data to feed to lavaan
 d_fake <- 
@@ -92,13 +91,13 @@ d_fake <-
 
 ```{r}
 
-# Generate some random data (we change this to correct values later)
+# Create the run_simulation function 
 run_simulation <- function(
-    pop_tau_prime = 0,
-    pop_alpha    = 0,
-    pop_beta     = 0,
-    sample_sizes  = 50,
-    num_reps = 10
+    pop_tau_prime,
+    pop_alpha,
+    pop_beta,
+    sample_sizes,
+    num_reps
 ) {
   
   # Generate the true values using lavaan
@@ -123,7 +122,8 @@ run_simulation <- function(
   pop_cov <- lavaan::lavInspect(fit, "cov.all")
   
   # Using mvrnorm() with empirical = TRUE gives a data frame that 
-  # will reproduce the population covariance matrix. 
+  # will reproduce the population covariance matrix ("true" values). 
+  # Not exact, but VERY close (e.g., -1e-34 instead of 0)
   pop_data <- 
     MASS::mvrnorm(
       n = sample_sizes, 
@@ -140,7 +140,7 @@ run_simulation <- function(
   
   
   sim_results <- lapply(1:num_reps, function(x) {
-    # changing empirical to FALSE means we get a sample
+    # changing empirical to FALSE means we get a sample, (simulated values)
     
     sim_results_df <- 
       sample_data <- 
@@ -151,9 +151,12 @@ run_simulation <- function(
         empirical = FALSE
       ) %>% as.data.frame()
     
+    # Getting our results from each replication
     sample_results <- rsquare_med(data = sample_data, x = "x", m = "m", y = "y" ) %>%
       as.data.frame()
   }) %>% 
+    # Here, everything gets averaged. Instead of num_reps parameters, just the
+    # average at the end
     dplyr::bind_rows() %>%
     summarize(across(where(is.numeric), mean)) %>%
     t() %>%
@@ -184,23 +187,21 @@ run_simulation <- function(
 ```{r}
 
 # Define the function to be applied to each row of df_params
+# Running it later, now giving it everything it needs to parallelize 
+
 sim_function <- function(params) {
   library(dplyr)
   
-  if (params[["N"]] == 50) {
-    print(params)
-    print(Sys.time())
-  }
   run_simulation(
     sample_sizes  = params[["N"]],
     pop_alpha = params[["pop_alpha"]],
     pop_beta = params[["pop_beta"]],
     pop_tau_prime = params[["pop_tau_prime"]],
-    num_reps = 1000
+    num_reps = 5000
   )
 }
 
-# Set up a cluster
+# Set up a cluster for parallel processing
 cl <- makeCluster(detectCores() - 1)
 
 # Export necessary variables and functions to the cluster
@@ -210,25 +211,21 @@ clusterExport(cl, c("df_params",
                     "d_fake",
                     "rsquare_med"))
 
-# Use parLapply to parallelize the apply function
+# Use parLapply to parallelize the simulations
 sim_res <- parLapply(cl, 1:nrow(df_params), function(i) sim_function(df_params[i, ]))
 
-# Stop the cluster after the computation is done
+# Stop the cluster after the computation is done, just in case
 stopCluster(cl)
 
+# Make data frame, round bias to nearest thousandth
+df_sim_res <- dplyr::bind_rows(sim_res) %>%
+  dplyr::mutate(bias = round(bias, 3))
 
-df_sim_res <- dplyr::bind_rows(sim_res)
-
+# Looks nicer
 knitr::kable(df_sim_res)
 
 
 ```
-
-
-
-
-
-
 
 
 

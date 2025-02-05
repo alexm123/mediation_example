@@ -1,0 +1,240 @@
+---
+title: "mediation_example"
+format: pdf
+editor: visual
+---
+
+```{r}
+library(dplyr)
+library(knitr)
+library(MASS)
+library(parallel)
+
+```
+
+## Creating R square mediated function
+
+
+```{r}
+rsquare_med <- function(data, x, m, y) {
+  # Compute correlations among the variables
+  rxm <- cor(data[x], data[[m]])
+  rxy <- cor(data[[x]], data[[y]])
+  rmy <- cor(data[[m]], data[[y]])
+
+  # Regression: m ~ x (to get alpha, first indirect path)
+  # Equation 2 in Fairchild, et al
+  model1 <- lm(as.formula(paste(m, "~", x)), data = data)
+  alpha <- coef(model1)[[x]]
+
+  # Regression: y ~ x + m (to get 'tau_prime' and 'beta')
+  # Equation 1 in Fairchild, et al
+  model2 <- lm(as.formula(paste(y, "~", x, "+", m)), data = data)
+  
+  tau_prime <- coef(model2)[[x]]
+  beta <- coef(model2)[[m]]
+  
+  # Compute total effect of x on y: tau = tau_prime + (alpha*beta)
+  total <- tau_prime + (alpha*beta)
+
+  
+  # Compute effect-size measures
+  mediatedeffect <- alpha * beta       # Indirect effect of x on y via M = alpha*beta
+  rxmsquared <- rxm^2                  # squared correlation between x and m
+  partialrxy_msquared <- ((rxy - rmy * rxm) / sqrt((1 - rmy^2) * (1 - rxmsquared)))^2
+  partialrmy_xsquared <- ((rmy - rxy * rxm) / sqrt((1 - rxy^2) * (1 - rxmsquared)))^2
+  overallrsquared <- (((rxy^2) + (rmy^2)) - (2 * rxy * rmy * rxm)) / (1 - rxmsquared)
+  rsquaredmediated <- (rmy^2) - (overallrsquared - (rxy^2))
+
+  # Create a list of results
+  results <- list(
+    alpha = alpha,
+    beta = beta,
+    tau_prime = tau_prime,
+    total = total,
+    mediatedeffect = mediatedeffect,
+    rxm = rxm,
+    rxmsquared = rxmsquared,
+    rxy = rxy,
+    rmy = rmy,
+    partialrxy_msquared = partialrxy_msquared,
+    partialrmy_xsquared = partialrmy_xsquared,
+    overallrsquared = overallrsquared,
+    rsquaredmediated = rsquaredmediated
+  )
+
+  return(results)
+}
+```
+
+
+## Set up the simulation parameters.
+
+```{r}
+sample_sizes <- c(50, 100, 200, 500, 1000)
+effect_sizes <- c(0.00, 0.14, 0.39, 0.59)  # Null, small, medium, large
+
+# Containing all the conditions 
+df_params <- expand.grid(
+  N = sample_sizes, 
+  pop_alpha = effect_sizes, 
+  pop_beta = effect_sizes, 
+  pop_tau_prime = effect_sizes)
+num_reps <- 1000  # Number of replications per condition
+
+# Making some fake data to feed to lavaan
+d_fake <- 
+  data.frame(x = rnorm(sample_sizes),
+                m = rnorm(sample_sizes),
+                y = rnorm(sample_sizes))
+
+```
+
+```{r}
+
+# Generate some random data (we change this to correct values later)
+run_simulation <- function(
+    pop_tau_prime = 0,
+    pop_alpha    = 0,
+    pop_beta     = 0,
+    sample_sizes  = 50,
+    num_reps = 10
+) {
+  
+  # Generate the true values using lavaan
+  # Create a lavaan model where all values are constrained to
+  # the population values that we want to use
+  dgf <- glue::glue("
+  # Equation 1 from Fairchild et al., without error term
+  y ~ {pop_tau_prime} * x + {pop_beta} * m
+  
+  # Equation 2 from Fairchild et al., without error term
+  m ~ {pop_alpha} * x
+  
+  x ~~ 1 * x
+  y ~~ 1 * y
+  m ~~ 1 * m"
+  )
+  
+  # Fit the model, and the implied covariance matrix is the 
+  # population covariance matrix
+  fit <- lavaan::lavaan(model = dgf, data = d_fake)
+  summary(fit)
+  pop_cov <- lavaan::lavInspect(fit, "cov.all")
+  
+  # Using mvrnorm() with empirical = TRUE gives a data frame that 
+  # will reproduce the population covariance matrix. 
+  pop_data <- 
+    MASS::mvrnorm(
+      n = sample_sizes, 
+      mu = c(0, 0, 0), 
+      Sigma = pop_cov, 
+      empirical = TRUE
+    ) %>% as.data.frame()
+  
+  pop_results <- rsquare_med(data = pop_data, x = "x", m = "m", y = "y" ) %>%
+    as.data.frame() %>%
+    t() %>%
+    as.data.frame() %>% 
+    tibble::rownames_to_column("parameter")
+  
+  
+  sim_results <- lapply(1:num_reps, function(x) {
+    # changing empirical to FALSE means we get a sample
+    
+    sim_results_df <- 
+      sample_data <- 
+      MASS::mvrnorm(
+        n = sample_sizes, 
+        mu = c(0, 0, 0), 
+        Sigma = pop_cov, 
+        empirical = FALSE
+      ) %>% as.data.frame()
+    
+    sample_results <- rsquare_med(data = sample_data, x = "x", m = "m", y = "y" ) %>%
+      as.data.frame()
+  }) %>% 
+    dplyr::bind_rows() %>%
+    summarize(across(where(is.numeric), mean)) %>%
+    t() %>%
+    as.data.frame() %>% 
+    tibble::rownames_to_column("parameter")
+  
+  res_joined <- 
+    dplyr::full_join(pop_results, sim_results, by = "parameter") %>%
+    purrr::set_names("parameter", "pop_r2_med", "sim_r2_med") %>%
+    dplyr::mutate(bias = sim_r2_med - pop_r2_med) %>%
+    dplyr::filter(parameter == "rsquaredmediated") %>%
+    dplyr::mutate(
+      pop_alpha = pop_alpha, 
+      pop_beta = pop_beta,
+      pop_tau_prime = pop_tau_prime,
+      n = sample_sizes
+    ) %>%
+    dplyr::select(
+      pop_alpha, pop_beta, pop_tau_prime, n,
+      pop_r2_med, sim_r2_med, bias
+    )
+} 
+
+```
+
+## Now run_simulation for every row in df_params
+
+```{r}
+
+# Define the function to be applied to each row of df_params
+sim_function <- function(params) {
+  library(dplyr)
+  
+  if (params[["N"]] == 50) {
+    print(params)
+    print(Sys.time())
+  }
+  run_simulation(
+    sample_sizes  = params[["N"]],
+    pop_alpha = params[["pop_alpha"]],
+    pop_beta = params[["pop_beta"]],
+    pop_tau_prime = params[["pop_tau_prime"]],
+    num_reps = 1000
+  )
+}
+
+# Set up a cluster
+cl <- makeCluster(detectCores() - 1)
+
+# Export necessary variables and functions to the cluster
+clusterExport(cl, c("df_params", 
+                    "run_simulation", 
+                    "sim_function", 
+                    "d_fake",
+                    "rsquare_med"))
+
+# Use parLapply to parallelize the apply function
+sim_res <- parLapply(cl, 1:nrow(df_params), function(i) sim_function(df_params[i, ]))
+
+# Stop the cluster after the computation is done
+stopCluster(cl)
+
+
+df_sim_res <- dplyr::bind_rows(sim_res)
+
+knitr::kable(df_sim_res)
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

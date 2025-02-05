@@ -1,5 +1,5 @@
 ---
-title: "mediation_example"
+title: "med_irl_example"
 format: pdf
 editor: visual
 ---

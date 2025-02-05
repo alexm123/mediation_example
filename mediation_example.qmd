@@ -136,7 +136,15 @@ run_simulation <- function(
     as.data.frame() %>%
     t() %>%
     as.data.frame() %>% 
-    tibble::rownames_to_column("parameter")
+    tibble::rownames_to_column("parameter") 
+  
+    # %>%
+    # #adding the population little r^2's
+    # dplyr::mutate(
+    #   pop_rxmsquared = rxmsquared,
+    #   pop_partialrmy_xsquared = partialrmy_xsquared,
+    #   pop_partialrxy_msquared = partialrxy_msquared
+    # )
   
   
   sim_results <- lapply(1:num_reps, function(x) {
@@ -153,31 +161,83 @@ run_simulation <- function(
     
     # Getting our results from each replication
     sample_results <- rsquare_med(data = sample_data, x = "x", m = "m", y = "y" ) %>%
-      as.data.frame()
+      as.data.frame() 
+    
+      # %>% 
+      #adding our simulated little r^2's
+      # dplyr::mutate(
+      #   sim_rxmsquared = rxmsquared,
+      #   sim_partialrmy_xsquared = partialrmy_xsquared,
+      #   sim_partialrxy_msquared = partialrxy_msquared
+      # )
+    
   }) %>% 
-    # Here, everything gets averaged. Instead of num_reps parameters, just the
-    # average at the end
+    # Here, after lapply loop, everything gets averaged. 
+    # Instead of num_reps parameters, just the average at the end
     dplyr::bind_rows() %>%
     summarize(across(where(is.numeric), mean)) %>%
     t() %>%
     as.data.frame() %>% 
     tibble::rownames_to_column("parameter")
   
+  # res_joined <- 
+  #   dplyr::full_join(pop_results, sim_results, by = "parameter") %>%
+  #   purrr::set_names("parameter", "pop_r2_med", "sim_r2_med") %>%
+  #   dplyr::mutate(bias = sim_r2_med - pop_r2_med) %>%
+  #   dplyr::filter(parameter == "rsquaredmediated") %>%
+  #   dplyr::mutate(
+  #     pop_alpha = pop_alpha, 
+  #     pop_beta = pop_beta,
+  #     pop_tau_prime = pop_tau_prime,
+  #     n = sample_sizes
+  #   ) %>%
+  #   dplyr::select(
+  #     pop_alpha, pop_beta, pop_tau_prime, n,
+  #     pop_r2_med, sim_r2_med, bias
+  #   )
   res_joined <- 
-    dplyr::full_join(pop_results, sim_results, by = "parameter") %>%
-    purrr::set_names("parameter", "pop_r2_med", "sim_r2_med") %>%
-    dplyr::mutate(bias = sim_r2_med - pop_r2_med) %>%
-    dplyr::filter(parameter == "rsquaredmediated") %>%
-    dplyr::mutate(
-      pop_alpha = pop_alpha, 
-      pop_beta = pop_beta,
-      pop_tau_prime = pop_tau_prime,
-      n = sample_sizes
-    ) %>%
-    dplyr::select(
-      pop_alpha, pop_beta, pop_tau_prime, n,
-      pop_r2_med, sim_r2_med, bias
-    )
+  dplyr::full_join(pop_results, sim_results, by = "parameter") %>%
+  purrr::set_names("parameter", "pop_value", "sim_value") %>%
+  dplyr::mutate(bias = sim_value - pop_value) %>%
+  dplyr::filter(parameter %in% c(
+      "alpha", "beta", "tau_prime", "rsquaredmediated",
+      "rxmsquared", "partialrmy_xsquared", "partialrxy_msquared"
+    )) %>%
+  dplyr::mutate(
+    pop_alpha = pop_alpha, 
+    pop_beta = pop_beta,
+    pop_tau_prime = pop_tau_prime,
+    n = sample_sizes
+  ) %>%
+  dplyr::select(
+    pop_alpha, pop_beta, pop_tau_prime, n,
+    parameter, pop_value, sim_value, bias
+  )
+  
+  res_wide <- res_joined %>%
+  tidyr::pivot_wider(
+    names_from = parameter,
+    values_from = c(pop_value, sim_value, bias),
+    names_glue = "{.value}_{parameter}"
+  ) %>%
+  # Rename the columns
+  dplyr::rename(
+    bias_r2_med = bias_rsquaredmediated,
+    bias_a      = bias_alpha,
+    bias_b      = bias_beta,
+    bias_tp      = bias_tau_prime,
+    
+    pv_r2med = pop_value_rsquaredmediated,
+    sv_r2med = sim_value_rsquaredmediated,
+    
+    pv_rxm2   = pop_value_rxmsquared,
+    pv_rxy_m2 = pop_value_partialrxy_msquared,
+    pv_rmy_x2 = pop_value_partialrmy_xsquared
+    
+    
+  )
+
+  
 } 
 
 ```
@@ -197,7 +257,7 @@ sim_function <- function(params) {
     pop_alpha = params[["pop_alpha"]],
     pop_beta = params[["pop_beta"]],
     pop_tau_prime = params[["pop_tau_prime"]],
-    num_reps = 5000
+    num_reps = 1000
   )
 }
 
@@ -217,21 +277,106 @@ sim_res <- parLapply(cl, 1:nrow(df_params), function(i) sim_function(df_params[i
 # Stop the cluster after the computation is done, just in case
 stopCluster(cl)
 
-# Make data frame, round bias to nearest thousandth
+## Make data frame, round biases to nearest thousandth
+# df_sim_res <- dplyr::bind_rows(sim_res) %>%
+#   dplyr::mutate(across(starts_with("bias_"), ~ round(.x, 3)))
+
+## Make data frame, round everything to nearest thousandth
 df_sim_res <- dplyr::bind_rows(sim_res) %>%
-  dplyr::mutate(bias = round(bias, 3))
+   mutate(across(where(is.numeric), ~ round(.x, 3)))
 
-# Looks nicer
-knitr::kable(df_sim_res)
+```
+
+# df_sim_res much too wide, splitting up into multiple dataframes: 
+# First corresponds with Table 2 (Fairchild et al., 2009)
+```{r}
+
+df_sim_res_r2med <- df_sim_res %>%
+  dplyr::select(pop_alpha, 
+                pop_beta, 
+                pop_tau_prime, 
+                n,
+                pv_r2med, 
+                sv_r2med, 
+                bias_r2_med)
+knitr::kable(df_sim_res_r2med)
+
+df_sim_res_alpha <- df_sim_res %>%
+  dplyr::select(pop_alpha, 
+                pop_beta, 
+                pop_tau_prime, 
+                n,
+                pop_value_alpha, sim_value_alpha, bias_a)
+
+df_sim_res_beta <- df_sim_res %>%
+  dplyr::select(pop_alpha, 
+                pop_beta, 
+                pop_tau_prime, 
+                n,
+                pop_value_beta, sim_value_beta, bias_b)
+
+df_sim_res_tauprime <- df_sim_res %>%
+  dplyr::select(pop_alpha, 
+                pop_beta, 
+                pop_tau_prime, 
+                n,
+                pop_value_tau_prime, sim_value_tau_prime, bias_tp)
+```
 
 
+
+### Component r^2 measures 
+# r^2 xm
+```{r}
+
+df_sim_res_littler_alpha <- df_sim_res %>% 
+  dplyr::select(pop_alpha, sim_value_alpha,
+                n,
+                sim_value_rxmsquared, 
+                bias_rxmsquared) %>% 
+  dplyr::rename(
+    sv_rxm2 = sim_value_rxmsquared
+  )
+knitr::kable(df_sim_res_littler_alpha)
 ```
 
 
 
 
+# r^2 ym.x
+```{r}
+df_sim_res_littler_beta <- df_sim_res %>% 
+  dplyr::select(pop_beta, sim_value_beta, 
+                n,
+                sim_value_partialrmy_xsquared, 
+                bias_partialrmy_xsquared) %>% 
+  dplyr::rename(
+    sv_p_rmy_x2  = sim_value_partialrmy_xsquared,
+    bias_p_rmy_x2 = bias_partialrmy_xsquared
+    
+  )
+
+knitr::kable(df_sim_res_littler_beta)
+```
+
+
+# r^2 yx.m
+```{r}
+df_sim_res_littler_tauprime <- df_sim_res %>% 
+  dplyr::select(pop_tau_prime, sim_value_tau_prime,
+                n,
+                sim_value_partialrxy_msquared, 
+                bias_partialrxy_msquared) %>% 
+  dplyr::rename(
+    sv_p_rxy_m2  = sim_value_partialrxy_msquared,
+    bias_p_rxy_m2 = bias_partialrxy_msquared
+  )
+
+knitr::kable(df_sim_res_littler_tauprime)
+
+```
 
 
 
-
+```
 

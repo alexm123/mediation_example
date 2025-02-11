@@ -1,0 +1,359 @@
+---
+title: "mediation_simulation"
+format: pdf
+editor: visual
+---
+
+```{r}
+library(dplyr)
+library(knitr)
+library(MASS)
+library(parallel)
+
+```
+
+## Creating R square mediated function
+
+
+```{r}
+rsquare_med <- function(data, x, m, y) {
+  # Compute correlations among the variables
+  rxm <- cor(data[x], data[[m]])
+  rxy <- cor(data[[x]], data[[y]])
+  rmy <- cor(data[[m]], data[[y]])
+
+  # Regression: m ~ x (to get alpha, first indirect path)
+  # Equation 2 in Fairchild, et al
+  model1 <- lm(as.formula(paste(m, "~", x)), data = data)
+  alpha <- coef(model1)[[x]]
+
+  # Regression: y ~ x + m (to get 'tau_prime' and 'beta')
+  # Equation 1 in Fairchild, et al
+  model2 <- lm(as.formula(paste(y, "~", x, "+", m)), data = data)
+  
+  tau_prime <- coef(model2)[[x]]
+  beta <- coef(model2)[[m]]
+  
+  # Compute total effect of x on y: tau = tau_prime + (alpha*beta)
+  total <- tau_prime + (alpha*beta)
+
+  
+  # Compute effect-size measures
+  mediatedeffect <- alpha * beta       # Indirect effect of x on y via M = alpha*beta
+  rxmsquared <- rxm^2                  # squared correlation between x and m
+  partialrxy_msquared <- ((rxy - rmy * rxm) / sqrt((1 - rmy^2) * (1 - rxmsquared)))^2
+  partialrmy_xsquared <- ((rmy - rxy * rxm) / sqrt((1 - rxy^2) * (1 - rxmsquared)))^2
+  overallrsquared <- (((rxy^2) + (rmy^2)) - (2 * rxy * rmy * rxm)) / (1 - rxmsquared)
+  rsquaredmediated <- (rmy^2) - (overallrsquared - (rxy^2))
+  proportionmediated <- if (total != 0) mediatedeffect / total else NA
+
+  # Create a list of results
+  results <- list(
+    alpha = alpha,
+    beta = beta,
+    tau_prime = tau_prime,
+    total = total,
+    mediatedeffect = mediatedeffect,
+    rxm = rxm,
+    rxmsquared = rxmsquared,
+    rxy = rxy,
+    rmy = rmy,
+    partialrxy_msquared = partialrxy_msquared,
+    partialrmy_xsquared = partialrmy_xsquared,
+    overallrsquared = overallrsquared,
+    rsquaredmediated = rsquaredmediated,
+    proportionmediated = proportionmediated
+  )
+
+  return(results)
+}
+```
+
+
+## Set up the simulation parameters.
+
+```{r}
+sample_sizes <- c(20, 50, 100, 200, 500, 1000)
+effect_sizes <- c(0.00, 0.14, 0.39, 0.59)  # Null, small, medium, large
+
+# Containing all the conditions 
+df_params <- expand.grid(
+  N = sample_sizes, 
+  pop_alpha = effect_sizes, 
+  pop_beta = effect_sizes, 
+  pop_tau_prime = effect_sizes)
+
+# Making some fake data to feed to lavaan
+d_fake <- 
+  data.frame(x = rnorm(sample_sizes),
+             m = rnorm(sample_sizes),
+             y = rnorm(sample_sizes))
+
+```
+
+```{r}
+
+run_simulation <- function(pop_tau_prime,
+                           pop_alpha,
+                           pop_beta,
+                           sample_size,
+                           num_reps) {
+  # Build the lavaan model string with the supplied population parameters.
+  model_string <- glue("
+    # Equation 1 from Fairchild et al., without error term
+    y ~ {pop_tau_prime} * x + {pop_beta} * m
+    
+    # Equation 2 from Fairchild et al., without error term
+    m ~ {pop_alpha} * x
+    
+    # Fixing variances of observed variables to 1
+    x ~~ 1 * x
+    y ~~ 1 * y
+    m ~~ 1 * m
+  ")
+  
+  # Fit the lavaan model to a (global) dataset d_fake.
+  # (Remove the next line if you do not need the printed summary.)
+  fit <- lavaan(model = model_string, data = d_fake)
+  # (The summary() is removed here for speed.)
+  pop_cov <- lavInspect(fit, "cov.all")
+  
+  # Generate one “population” dataset using empirical = TRUE.
+  pop_data <- as.data.frame(
+    MASS::mvrnorm(n = sample_size,
+                  mu = rep(0, 3),
+                  Sigma = pop_cov,
+                  empirical = TRUE)
+  )
+  # Get the “true” values using rsquare_med()
+  pop_rs <- unlist(rsquare_med(data = pop_data, x = "x", m = "m", y = "y"))
+    pop_rs["proportion_mediated"] <- if (pop_rs["total"] != 0) {
+    pop_rs["mediatedeffect"] / pop_rs["total"]
+  } else NA
+    
+  # Replicate the simulation replications.
+  # For each replication, generate a sample (empirical = FALSE) and compute rsquare_med().
+  sim_matrix <- replicate(num_reps, {
+    sim_data <- MASS::mvrnorm(n = sample_size,
+                              mu = rep(0, 3),
+                              Sigma = pop_cov,
+                              empirical = FALSE)
+    unlist(rsquare_med(data = as.data.frame(sim_data), x = "x", m = "m", y = "y"))
+  })
+  # Calculate the mean across replications for each parameter.
+  sim_means <- rowMeans(sim_matrix)
+  sim_means["proportion_mediated"] <- if (sim_means["total"] != 0) {
+    sim_means["mediatedeffect"] / sim_means["total"]
+  } else NA
+  
+  # Combine the population and simulation (averaged) results.
+  res <- data.frame(
+    parameter = names(pop_rs),
+    pop_value = pop_rs,
+    sim_value = sim_means,
+    bias = sim_means - pop_rs,
+    stringsAsFactors = FALSE
+  )
+  
+  # Filter to include only the parameters of interest.
+  res <- filter(res, parameter %in% c("alpha", "beta", "tau_prime",
+                                      "rsquaredmediated", "rxmsquared",
+                                      "partialrmy_xsquared", "partialrxy_msquared",
+                                      "proportionmediated"))
+  
+  # Add additional columns.
+  res <- res %>%
+    mutate(pop_alpha = pop_alpha,
+           pop_beta = pop_beta,
+           pop_tau_prime = pop_tau_prime,
+           n = sample_size) %>%
+    select(pop_alpha, pop_beta, pop_tau_prime, n, parameter, pop_value, sim_value, bias)
+  
+  # Pivot results to wide format
+  res_wide <- res %>%
+    pivot_wider(
+      names_from = parameter,
+      values_from = c(pop_value, sim_value, bias),
+      names_glue = "{.value}_{parameter}"
+    ) %>%
+    # Rename columns
+    rename(
+      bias_r2_med = bias_rsquaredmediated,
+      bias_a      = bias_alpha,
+      bias_b      = bias_beta,
+      bias_tp     = bias_tau_prime,
+      
+      pv_r2med = pop_value_rsquaredmediated,
+      sv_r2med = sim_value_rsquaredmediated,
+      
+      pv_rxm2   = pop_value_rxmsquared,
+      pv_rxy_m2 = pop_value_partialrxy_msquared,
+      pv_rmy_x2 = pop_value_partialrmy_xsquared
+    )
+  
+  return(res_wide)
+}
+```
+
+## Now run_simulation for every row in df_params
+
+```{r}
+
+# Define the function to be applied to each row of df_params
+# Running it later, now giving it everything it needs to parallelize 
+
+sim_function <- function(params) {
+  run_simulation(
+    sample_size  = params[["N"]],
+    pop_alpha    = params[["pop_alpha"]],
+    pop_beta     = params[["pop_beta"]],
+    pop_tau_prime= params[["pop_tau_prime"]],
+    num_reps     = 2000
+  )
+}
+
+# Set up a cluster for parallel processing
+cl <- makeCluster(detectCores() - 1)
+
+# Export necessary variables to the cluster
+clusterExport(cl, c("df_params", 
+                    "run_simulation", 
+                    "sim_function", 
+                    "d_fake",
+                    "rsquare_med"))
+# Export necessary packages to the cluster
+clusterEvalQ(cl, {
+  library(MASS)
+  library(lavaan)
+  library(glue)
+  library(dplyr)
+  library(tidyr)
+})
+
+# Use parLapply to parallelize the simulations
+system_time <- system.time({
+  sim_res <- parLapply(cl, 1:nrow(df_params), function(i) sim_function(df_params[i, ]))
+})
+
+
+# Stop the cluster after the computation is done, just in case
+stopCluster(cl)
+
+## Make data frame, # round everything to nearest thousandth
+df_sim_res <- dplyr::bind_rows(sim_res) #%>%
+   #mutate(across(where(is.numeric), ~ round(.x, 3)))
+system_time
+```
+
+# Who had the highest proportion of acceptable bias? (<0.01)
+```{r}
+df_sim_res <- df_sim_res %>%
+  mutate(
+    bias_r2_med_acceptable = ifelse(bias_r2_med < 0.01, 1, 0),
+    bias_proportionmediated_acceptable = ifelse(bias_proportionmediated < 0.01, 1, 0)
+  )
+
+# Summarize the proportions of acceptable bias for each sample size
+summary_table <- df_sim_res %>%
+  group_by(n) %>%
+  summarise(
+    bias_r2_med_acceptable = mean(bias_r2_med_acceptable),
+    bias_propmediated_acceptable = mean(bias_proportionmediated_acceptable),
+    mean_bias_r2_med = mean(bias_r2_med),
+    mean_bias_propmediated = mean(bias_proportionmediated),
+  ) 
+
+# Display as pretty table
+kable(summary_table, caption = "Proportion and Mean Acceptable Bias by Sample Size", align = "c", digits = 5)
+
+```
+
+
+## df_sim_res much too wide, splitting up into multiple dataframes: 
+## First corresponds with Table 2 (Fairchild et al., 2009)
+```{r}
+
+df_sim_res_r2med <- df_sim_res %>%
+  dplyr::select(pop_alpha, 
+                pop_beta, 
+                pop_tau_prime, 
+                n,
+                pv_r2med, 
+                sv_r2med, 
+                bias_r2_med)
+knitr::kable(df_sim_res_r2med)
+
+df_sim_res_alpha <- df_sim_res %>%
+  dplyr::select(pop_alpha, 
+                pop_beta, 
+                pop_tau_prime, 
+                n,
+                pop_value_alpha, sim_value_alpha, bias_a)
+
+df_sim_res_beta <- df_sim_res %>%
+  dplyr::select(pop_alpha, 
+                pop_beta, 
+                pop_tau_prime, 
+                n,
+                pop_value_beta, sim_value_beta, bias_b)
+
+df_sim_res_tauprime <- df_sim_res %>%
+  dplyr::select(pop_alpha, 
+                pop_beta, 
+                pop_tau_prime, 
+                n,
+                pop_value_tau_prime, sim_value_tau_prime, bias_tp)
+```
+
+
+
+### Component r^2 measures 
+# r^2 xm
+```{r}
+
+df_sim_res_littler_alpha <- df_sim_res %>% 
+  dplyr::select(pop_alpha, sim_value_alpha,
+                n,
+                sim_value_rxmsquared, 
+                bias_rxmsquared) %>% 
+  dplyr::rename(
+    sv_rxm2 = sim_value_rxmsquared
+  )
+knitr::kable(df_sim_res_littler_alpha)
+```
+
+
+
+
+# r^2 ym.x
+```{r}
+df_sim_res_littler_beta <- df_sim_res %>% 
+  dplyr::select(pop_beta, sim_value_beta, 
+                n,
+                sim_value_partialrmy_xsquared, 
+                bias_partialrmy_xsquared) %>% 
+  dplyr::rename(
+    sv_p_rmy_x2  = sim_value_partialrmy_xsquared,
+    bias_p_rmy_x2 = bias_partialrmy_xsquared
+    
+  )
+
+knitr::kable(df_sim_res_littler_beta)
+```
+
+
+# r^2 yx.m
+```{r}
+df_sim_res_littler_tauprime <- df_sim_res %>% 
+  dplyr::select(pop_tau_prime, sim_value_tau_prime,
+                n,
+                sim_value_partialrxy_msquared, 
+                bias_partialrxy_msquared) %>% 
+  dplyr::rename(
+    sv_p_rxy_m2  = sim_value_partialrxy_msquared,
+    bias_p_rxy_m2 = bias_partialrxy_msquared
+  )
+
+knitr::kable(df_sim_res_littler_tauprime)
+
+```

@@ -11,6 +11,10 @@ library(lavaan)
 library(glue)
 library(dplyr)
 library(ggplot2)
+library(parallel)
+library(boot)
+library(QuantPsyc)
+
 rsquare_med <- function(data, x, m, y) {
   # Compute correlations among the variables
   rxm <- cor(data[x], data[[m]])
@@ -41,7 +45,12 @@ rsquare_med <- function(data, x, m, y) {
   overallrsquared <- (((rxy^2) + (rmy^2)) - (2 * rxy * rmy * rxm)) / (1 - rxmsquared)
   rsquaredmediated <- (rmy^2) - (overallrsquared - (rxy^2))
   proportionmediated <- if (total != 0) mediatedeffect / total else NA
-
+  
+  # Calculate upsilon from Lachowicz, Preacher, and Kelly (2018)
+  
+  beta_YX_M <- QuantPsyc::lm.beta(model2)[[x]]
+  beta_MX <- QuantPsyc::lm.beta(model1)[[x]]
+  upsilon <- (rmy - (beta_MX * beta_YX_M))^2 - (overallrsquared - (rxy^2))
   # Create a list of results
   results <- list(
     alpha = alpha,
@@ -57,6 +66,7 @@ rsquare_med <- function(data, x, m, y) {
     partialrmy_xsquared = partialrmy_xsquared,
     overallrsquared = overallrsquared,
     rsquaredmediated = rsquaredmediated,
+    upsilon = upsilon,
     proportionmediated = proportionmediated
   )
 
@@ -176,16 +186,20 @@ ggplot(sim_results_indirect, aes(x = indirect_effect, y = sv_r2med, color = cond
 
 
 ```{r}
+set.seed(42)
 simulate_random_model <- function(sample_size = 1000, num_reps = 100) {
-  # Randomly draw α and β from Uniform(-2, 2)
-  pop_alpha <- runif(1, min = -2, max = 2)
-  pop_beta  <- runif(1, min = -2, max = 2)
+  # Randomly draw α and β from a normal distribution
+  pop_alpha <- rnorm(1)
+  pop_beta  <- rnorm(1)
+  total_effect <- 0.2
+  #pop_alpha <- runif(1, min=-2, max=2)
+  #pop_beta <- runif(1, min=-2, max=2)
   
   # Compute the indirect effect (α * β)
   indirect_effect <- pop_alpha * pop_beta
   
-  # Set τ′ (tau prime) to 0
-  pop_tau_prime <- 0
+  # Adjust τ′ (tau prime) so that the total effect (tau_prime + α * β) equals total_effect
+  pop_tau_prime <- total_effect - indirect_effect
   
   # Create a "fake" dataset for lavaan (its only purpose is to help define the model)
   d_fake <- data.frame(
@@ -196,7 +210,7 @@ simulate_random_model <- function(sample_size = 1000, num_reps = 100) {
   
   # Build the lavaan model string using glue()
   model_string <- glue("
-    # Equation for y (direct effect from x is 0)
+    # Equation for y (direct effect from x is tau_prime)
     y ~ {pop_tau_prime}*x + {pop_beta}*m
     # Equation for m
     m ~ {pop_alpha}*x
@@ -219,48 +233,96 @@ simulate_random_model <- function(sample_size = 1000, num_reps = 100) {
   )
   pop_rs <- rsquare_med(data = pop_data, x = "x", m = "m", y = "y")
   
-  # Run simulation replications (with empirical = FALSE)
-  sim_matrix <- replicate(num_reps, {
-    sim_data <- as.data.frame(
-      MASS::mvrnorm(n = sample_size,
-                    mu = rep(0, 3),
-                    Sigma = pop_cov,
-                    empirical = FALSE)
-    )
-    unlist(rsquare_med(data = sim_data, x = "x", m = "m", y = "y"))
-  })
-  sim_means <- rowMeans(sim_matrix)
-  sim_means["proportionmediated"] <- if (sim_means["total"] != 0) {
-    sim_means["mediatedeffect"] / sim_means["total"]
-  } else NA
-  
+  #Run simulation replications (with empirical = FALSE)
+  # sim_matrix <- replicate(num_reps, {
+  #   sim_data <- as.data.frame(
+  #     MASS::mvrnorm(n = sample_size,
+  #                   mu = rep(0, 3),
+  #                   Sigma = pop_cov,
+  #                   empirical = FALSE)
+  #   )
+  #   unlist(rsquare_med(data = sim_data, x = "x", m = "m", y = "y"))
+  # })
+  # sim_means <- rowMeans(sim_matrix)
+  # sim_means["proportionmediated"] <- if (sim_means["total"] != 0) {
+  #   sim_means["mediatedeffect"] / sim_means["total"]
+  # } else NA
+
   # Return a data frame with the random parameters and simulation results
   data.frame(
     pop_alpha       = pop_alpha,
     pop_beta        = pop_beta,
     indirect_effect = indirect_effect,
     pop_r2med       = pop_rs$rsquaredmediated,
-    sv_r2med        = sim_means["rsquaredmediated"],
+    pop_upsilon     = pop_rs$upsilon,
+    #sv_r2med        = sim_means["rsquaredmediated"],
+    #sv_upsilon      = sim_means["upsilon"],
     stringsAsFactors = FALSE
   )
 }
 
 # Set the number of simulations
-n_sim <- 1000
+n_sim <- 1500
 
-# Run the simulations and combine the results into one data frame
-random_results <- do.call(rbind, lapply(1:n_sim, function(i) {
-  simulate_random_model(sample_size = 1000, num_reps = 100)
-}))
+# Determine the number of cores to use
+n_cores <- detectCores() - 1
 
-# Create a scatterplot of the indirect effect vs. the simulated R2 mediated.
-ggplot(random_results, aes(x = indirect_effect, y = sv_r2med)) +
+# Create a cluster
+cl <- makeCluster(n_cores)
+
+# Load required libraries on each worker
+clusterEvalQ(cl, {
+  library(MASS)
+  library(lavaan)
+  library(glue)
+  library(QuantPsyc)
+})
+
+# Export required objects to the cluster workers.
+# Make sure rsquare_med is defined in your environment or adjust accordingly.
+clusterExport(cl, varlist = c("simulate_random_model", "rsquare_med"))
+
+# Run the simulations in parallel using parLapply
+random_results_list <- parLapply(cl, 1:n_sim, function(i) {
+  simulate_random_model(sample_size = 100, num_reps = 1)
+})
+
+# Stop the cluster after finishing the parallel computation
+stopCluster(cl)
+
+# Combine the list of data frames into one data frame
+random_results <- do.call(rbind, random_results_list)
+
+# Create a scatterplot of the indirect effect vs. the simulated R² mediated.
+ggplot(random_results, aes(x = indirect_effect, y = pop_r2med)) +
   geom_point(size = 1, alpha = 1) +
-  labs(x = "Indirect Effect (a * b)",
-       y = "Simulated R2 Mediated (sv_r2med)",
-       title = "Simulation with Random a and b (Indirect Effect: [-4, 4], t' = 0)") +
+  labs(x = "Indirect Effect (α * β)",
+       y = "Simulated R² Mediated (sv_r2med)",
+       title = "Simulation with Random α and β (Indirect Effect: [-4, 4], Total Effect = 0.2)") +
+  scale_x_continuous(limits = c(-4, 4)) +
+  scale_y_continuous(limits = c(-1, 1)) +
   theme_minimal() +
   theme(plot.title = element_text(hjust = 0.5))
 
+ggplot(random_results, aes(x = indirect_effect, y = pop_upsilon)) +
+  geom_point(size = 1, alpha = 1) +
+  labs(x = "Indirect Effect (α * β)",
+       y = "Simulated R² Mediated (pop_upsilon)",
+       title = "Simulation with Random α and β (Indirect Effect: [-4, 4], Total Effect = 0.2)") +
+  scale_x_continuous(limits = c(-5, 6)) +
+  scale_y_continuous(limits = c(0, 30)) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+
 ```
+
+
+
+
+
+
+
+
 
